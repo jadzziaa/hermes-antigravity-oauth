@@ -179,6 +179,29 @@ class _AwaitableCompletion(SimpleNamespace):
         return _ready(self).__await__()
 
 
+# Neon sometimes answers by writing a tool result block itself, in the
+# transcript format this plugin uses for real results, instead of a reply or a
+# <tool_call>. Hermes would deliver that block to the user as the answer, so a
+# reply that opens with it fails the request and Hermes retries on a fresh worker.
+_ECHOED_TOOL_RESULT_PREFIX = "Tool Result ("
+
+
+def _echo_verdict(text: str) -> bool | None:
+    """True if text opens with an echoed tool result, False if not, None while undecided."""
+    head = text.lstrip()
+    if head.startswith(_ECHOED_TOOL_RESULT_PREFIX):
+        return True
+    if _ECHOED_TOOL_RESULT_PREFIX.startswith(head):
+        return None
+    return False
+
+
+def _echo_error() -> RuntimeError:
+    return RuntimeError(
+        "Antigravity execution failed: the model echoed a tool result instead of answering"
+    )
+
+
 class AntigravityStream(Iterator[Any]):
     """Streaming iterator yielding OpenAI ChatCompletionChunk objects from CLI stream-json."""
 
@@ -609,6 +632,7 @@ class AntigravityStream(Iterator[Any]):
         has_tool_calls = False
         has_content = False
         in_tool_call = False
+        echo_checked = False
         error_msg = ""
         status = ""
         # Positive evidence about how the stream ended: did a `result`
@@ -742,6 +766,13 @@ class AntigravityStream(Iterator[Any]):
                             yield self._make_chunk(content=text_delta)
                         else:
                             text_buffer += text_delta
+                            if not echo_checked and not has_tool_calls and not in_tool_call:
+                                verdict = _echo_verdict(text_buffer)
+                                if verdict:
+                                    raise _echo_error()
+                                if verdict is None:
+                                    continue
+                                echo_checked = True
                             while text_buffer:
                                 if in_tool_call:
                                     end_idx = text_buffer.find("</tool_call>")
@@ -837,6 +868,8 @@ class AntigravityStream(Iterator[Any]):
             self._stop_optional_readers()
             self._join_stdout_reader()
             if text_buffer and not has_tool_calls:
+                if self.has_tools and not echo_checked and _echo_verdict(text_buffer):
+                    raise _echo_error()
                 if self.has_tools or "<tool_call>" in text_buffer:
                     parsed_calls, extra_text = _parse_tool_block(text_buffer)
                     if parsed_calls:
